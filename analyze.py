@@ -2,11 +2,11 @@
 """
 FROST PoC - Timing trace analyzer and visualization.
 
-Reads exported JSON traces from the browser PoC and performs:
-  1. Baseline statistics
-  2. Contention detection via thresholding
-  3. Spike filtering (as described in the FROST paper)
-  4. Visual comparison of idle vs. contention periods
+Reads exported JSON traces and performs:
+  1. Baseline statistics (min, max, median, percentiles)
+  2. Spike filtering via rolling-mean replacement (FROST paper §4)
+  3. Contention detection via threshold on rolling average
+  4. PNG visualization (4-panel: raw, filtered, rolling mean, distribution)
 """
 
 import json
@@ -25,117 +25,111 @@ except ImportError:
 
 
 def filter_spikes(samples: np.ndarray, threshold_us: float = 1000.0, window: int = 100) -> np.ndarray:
-    """
-    Replace samples > threshold_us with the mean of `window` surrounding values.
-    As described in the FROST paper Section 4.
-    """
-    out = samples.copy().astype(np.float64)
-    spikes = np.where(out > threshold_us)[0]
-    for idx in spikes:
-        lo = max(0, idx - window // 2)
-        hi = min(len(out), idx + window // 2)
-        out[idx] = np.mean(out[lo:hi])
+    """Replace outliers (>threshold_us) with rolling-mean of `window` neighbors.
+    Fully vectorized via convolution — no Python loop over spike indices."""
+    out = samples.copy()
+    mask = out > threshold_us
+    if not mask.any():
+        return out
+    kernel = np.ones(window) / window
+    rolling = np.convolve(out, kernel, mode='same')
+    out[mask] = rolling[mask]
     return out
 
 
-def detect_contention(samples: np.ndarray, window: int = 50, threshold_std: float = 2.0) -> np.ndarray:
-    """
-    Simple contention detection: flag regions where rolling mean exceeds
-    baseline + threshold_std * std.
-    """
+def detect_contention(samples: np.ndarray, window: int = 50, n_std: float = 2.0):
+    """Flag regions where rolling mean > baseline + n_std * std.
+    Baseline = 10th percentile (robust against outlier contamination)."""
     baseline = np.percentile(samples, 10)
     std = np.std(samples[samples < baseline * 3])
-    rolling = np.convolve(samples, np.ones(window) / window, mode='same')
-    threshold = baseline + threshold_std * std
-    return rolling > threshold, threshold
+    kernel = np.ones(window) / window
+    rolling = np.convolve(samples, kernel, mode='same')
+    threshold = baseline + n_std * std
+    return rolling > threshold, threshold, rolling
+
+
+def print_stats(label: str, samples: np.ndarray):
+    print(f"  {label:20s}  mean={samples.mean():8.2f}  median={np.median(samples):8.2f}  "
+          f"p10={np.percentile(samples, 10):8.2f}  p90={np.percentile(samples, 90):8.2f}  "
+          f"min={samples.min():8.2f}  max={samples.max():8.2f}")
 
 
 def analyze(path: str):
     with open(path) as f:
         data = json.load(f)
 
-    samples = np.array(data['samples'], dtype=np.float64)
-    print(f"File:              {path}")
-    print(f"Samples:           {len(samples)}")
-    print(f"File size:         {data.get('fileSizeBytes', 'N/A')} bytes")
-    print(f"Read size:         {data.get('readSize', 4096)} B")
-    print(f"Duration:          {(len(samples) * 0.005):.1f}s (estimated at 200 Hz)")
+    samples = np.asarray(data['samples'], dtype=np.float64)
+    n = len(samples)
+    print(f"\n{'─' * 70}")
+    print(f"  File:            {path}")
+    print(f"  Samples:         {n}")
+    print(f"  File size:       {data.get('fileSizeBytes', 'N/A'):>12} B")
+    print(f"  Read size:       {data.get('readSize', 4096):>12} B")
+    print(f"  Est. duration:   {n * 0.005:>8.1f} s  (at ~200 Hz)")
 
-    print(f"\n--- Timing Statistics (raw) ---")
-    print(f"  Min:    {samples.min():.2f} µs")
-    print(f"  Max:    {samples.max():.2f} µs")
-    print(f"  Mean:   {samples.mean():.2f} µs")
-    print(f"  Median: {np.median(samples):.2f} µs")
-    print(f"  Std:    {samples.std():.2f} µs")
-    print(f"  p10:    {np.percentile(samples, 10):.2f} µs")
-    print(f"  p90:    {np.percentile(samples, 90):.2f} µs")
+    print(f"\n  {'─' * 55}")
+    print(f"  {'Statistic':>20}  {'mean':>8}  {'median':>8}  {'p10':>8}  {'p90':>8}  {'min':>8}  {'max':>8}")
+    print(f"  {'─' * 55}")
+    print_stats('Raw (µs)', samples)
 
     filtered = filter_spikes(samples)
-    print(f"\n--- After spike filtering (>1000 µs replaced) ---")
-    print(f"  Mean:   {filtered.mean():.2f} µs")
-    print(f"  Median: {np.median(filtered):.2f} µs")
+    print_stats('Filtered (µs)', filtered)
 
-    contention_mask, threshold = detect_contention(filtered)
-    pct_contended = contention_mask.mean() * 100
-    print(f"\n--- Contention Detection ---")
-    print(f"  Threshold:         {threshold:.2f} µs")
-    print(f"  Samples flagged:   {contention_mask.sum()} / {len(samples)} ({pct_contended:.1f}%)")
+    print(f"\n  Spikes removed:  {(samples > 1000).sum():>8}  ({((samples > 1000).sum() / n) * 100:.2f}%)")
 
-    if not HAS_MPL:
-        return
+    contention_mask, threshold, rolling = detect_contention(filtered)
+    pct = contention_mask.mean() * 100
+    print(f"\n  {'─' * 42}")
+    print(f"  Contention threshold:  {threshold:.2f} µs")
+    print(f"  Contended samples:     {contention_mask.sum():>8} / {n} ({pct:.1f}%)")
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
-    x = np.arange(len(samples))
+    if HAS_MPL:
+        fig, axes = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+        x = np.arange(n)
 
-    ax = axes[0]
-    ax.plot(x, samples, color='#0f0', linewidth=0.3, alpha=0.7)
-    ax.axhline(threshold, color='red', linestyle='--', linewidth=1, label=f'Contention threshold ({threshold:.0f} µs)')
-    ax.set_ylabel('Latency [µs]')
-    ax.set_title('FROST PoC - Raw SSD Access Latency Trace')
-    ax.legend(fontsize=8)
-    ax.set_facecolor('#111')
-    ax.grid(True, alpha=0.1)
+        for ax in axes:
+            ax.set_facecolor('#111')
+            ax.grid(True, alpha=0.1)
 
-    ax = axes[1]
-    ax.plot(x, filtered, color='#0ff', linewidth=0.3, alpha=0.7)
-    ax.fill_between(x, 0, filtered, where=contention_mask, color='red', alpha=0.15, label='Detected Contention')
-    ax.axhline(threshold, color='red', linestyle='--', linewidth=1, label=f'Threshold ({threshold:.0f} µs)')
-    ax.set_ylabel('Latency [µs]')
-    ax.set_title('Filtered Trace with Contention Regions (spikes >1ms replaced)')
-    ax.legend(fontsize=8)
-    ax.set_facecolor('#111')
-    ax.grid(True, alpha=0.1)
+        axes[0].plot(x, samples, color='#0f0', linewidth=0.3, alpha=0.7)
+        axes[0].axhline(threshold, color='red', ls='--', lw=1, label=f'threshold={threshold:.0f} µs')
+        axes[0].set_ylabel('Latency [µs]')
+        axes[0].set_title('FROST PoC — Raw SSD Access Latency Trace')
+        axes[0].legend(fontsize=8)
 
-    ax = axes[2]
-    rolling_mean = np.convolve(filtered, np.ones(50) / 50, mode='same')
-    ax.plot(x, rolling_mean, color='#ff0', linewidth=0.8)
-    ax.set_ylabel('Rolling Mean [µs]')
-    ax.set_title('Rolling Average (window=50)')
-    ax.set_facecolor('#111')
-    ax.grid(True, alpha=0.1)
+        axes[1].plot(x, filtered, color='#0ff', linewidth=0.3, alpha=0.7)
+        axes[1].fill_between(x, 0, filtered, where=contention_mask, color='red', alpha=0.15, label='Contention')
+        axes[1].axhline(threshold, color='red', ls='--', lw=1, label=f'threshold={threshold:.0f} µs')
+        axes[1].set_ylabel('Latency [µs]')
+        axes[1].set_title(f'Filtered (±{1000:.0f} µs clipped) with Contention Regions ({pct:.1f}%)')
+        axes[1].legend(fontsize=8)
 
-    ax = axes[3]
-    hist_bins = np.logspace(np.log10(max(samples.min(), 1)), np.log10(samples.max()), 80)
-    ax.hist(samples, bins=hist_bins, color='#0f0', alpha=0.7, label='Raw')
-    ax.hist(filtered, bins=hist_bins, color='#0ff', alpha=0.5, label='Filtered')
-    ax.axvline(threshold, color='red', linestyle='--', linewidth=1, label=f'Threshold ({threshold:.0f} µs)')
-    ax.set_xscale('log')
-    ax.set_xlabel('Latency [µs] (log scale)')
-    ax.set_ylabel('Count')
-    ax.set_title('Latency Distribution (log scale)')
-    ax.legend(fontsize=8)
-    ax.set_facecolor('#111')
+        axes[2].plot(x, rolling, color='#ff0', linewidth=0.8)
+        axes[2].axhline(threshold, color='red', ls='--', lw=1, alpha=0.6)
+        axes[2].set_ylabel('Rolling Mean [µs]')
+        axes[2].set_title('Rolling Average (window=50)')
 
-    fig.tight_layout()
-    out_path = Path(path).with_suffix('.png')
-    plt.savefig(out_path, dpi=150, facecolor='#111')
-    print(f"\n[+] Saved visualization to {out_path}")
+        lo = max(samples.min(), 1)
+        hi = samples.max()
+        bins = np.logspace(np.log10(lo), np.log10(hi), 80)
+        axes[3].hist(samples, bins=bins, color='#0f0', alpha=0.6, label='Raw')
+        axes[3].hist(filtered, bins=bins, color='#0ff', alpha=0.5, label='Filtered')
+        axes[3].axvline(threshold, color='red', ls='--', lw=1, label=f'threshold={threshold:.0f} µs')
+        axes[3].set_xscale('log')
+        axes[3].set_xlabel('Latency [µs]')
+        axes[3].set_ylabel('Count')
+        axes[3].set_title('Latency Distribution')
+        axes[3].legend(fontsize=8)
+
+        fig.tight_layout()
+        out_path = Path(path).with_suffix('.png')
+        plt.savefig(out_path, dpi=150, facecolor='#111')
+        print(f"\n  Saved: {out_path}")
 
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: python analyze.py <trace.json> [trace2.json ...]")
+        print("Usage: python analyze.py <trace.json> [trace.json ...]")
         sys.exit(1)
     for p in sys.argv[1:]:
         analyze(p)
-        print("=" * 60)
