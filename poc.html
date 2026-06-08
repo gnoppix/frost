@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FROST PoC - SSD Contention Measurement via OPFS</title>
+<style>
+body { font-family: monospace; background: #111; color: #0f0; margin: 20px; }
+h1 { color: #0f0; border-bottom: 1px solid #0f0; }
+h2 { color: #0f0; }
+#status { white-space: pre-wrap; font-size: 13px; max-height: 300px; overflow-y: scroll; border: 1px solid #0f0; padding: 8px; margin: 8px 0; background: #000; }
+#trace { white-space: pre-wrap; font-size: 11px; max-height: 500px; overflow-y: scroll; border: 1px solid #0f0; padding: 8px; margin: 8px 0; background: #000; }
+button { background: #0f0; color: #000; border: none; padding: 8px 16px; cursor: pointer; font-family: monospace; font-weight: bold; margin: 4px; }
+button:hover { background: #0a0; }
+button:disabled { background: #333; color: #666; cursor: not-allowed; }
+.controls { margin: 12px 0; }
+.summary { border: 1px solid #0f0; padding: 8px; margin: 8px 0; background: #000; }
+</style>
+</head>
+<body>
+<h1>FROST PoC — SSD Contention Measurement via OPFS</h1>
+<p>Based on: <em>"FROST: Fingerprinting Remotely using OPFS-based SSD Timing"</em> (Weissteiner et al.)</p>
+
+<div class="summary">
+  <strong>Status:</strong> <span id="statusText">Idle</span><br>
+  <strong>Measurements:</strong> <span id="countText">0</span><br>
+  <strong>File Size:</strong> <span id="sizeText">N/A</span><br>
+  <strong>Last 10 avg latency:</strong> <span id="avgText">N/A</span>
+</div>
+
+<div class="controls">
+  <button id="btnInit" onclick="init()">1. Init OPFS File</button>
+  <button id="btnMeasure" onclick="startMeasuring()" disabled>2. Measure SSD Timing</button>
+  <button id="btnStop" onclick="stopMeasuring()" disabled>Stop Measurement</button>
+  <button id="btnExport" onclick="exportTrace()" disabled>Export Trace (JSON)</button>
+  <button id="btnGenLoad" onclick="generateLoad()">Generate Contention</button>
+</div>
+
+<h2>Real-time Measurements (last 1000)</h2>
+<div id="trace">Waiting...</div>
+
+<h2>Event Log</h2>
+<div id="status">Ready. Click "Init OPFS File" to begin.</div>
+
+<script>
+const OPFS_FILE_SIZE = 512 * 1024 * 1024; // 512 MB
+const READ_SIZE = 4096; // 4 KB reads
+const MEASURE_INTERVAL_MS = 0;
+
+let fileHandle = null;
+let fileSize = 0;
+let measuring = false;
+let measurements = [];
+let lastValues = [];
+
+function log(msg) {
+  const el = document.getElementById('status');
+  const ts = new Date().toISOString().slice(11, 23);
+  el.textContent += `[${ts}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateUI() {
+  document.getElementById('statusText').textContent = measuring ? 'Measuring...' : (fileHandle ? 'Ready' : 'Idle');
+  document.getElementById('countText').textContent = measurements.length;
+  document.getElementById('avgText').textContent = measurements.length >= 10
+    ? (measurements.slice(-10).reduce((a, b) => a + b, 0) / 10).toFixed(2) + ' µs'
+    : 'N/A';
+}
+
+function updateTrace() {
+  const el = document.getElementById('trace');
+  const data = measurements.slice(-1000);
+  if (data.length === 0) { el.textContent = 'Waiting for measurements...'; return; }
+
+  const maxVal = Math.max(...data, 1);
+  const width = 60;
+  const lines = [];
+  const step = Math.max(1, Math.floor(data.length / 40));
+  for (let i = 0; i < data.length; i += step) {
+    const chunk = data.slice(i, i + step);
+    const avg = chunk.reduce((a, b) => a + b, 0) / chunk.length;
+    const barLen = Math.min(width, Math.round((avg / maxVal) * width));
+    const bar = '█'.repeat(barLen) + '░'.repeat(Math.max(0, width - barLen));
+    const label = avg.toFixed(1).padStart(7);
+    lines.push(`${label} µs |${bar}|`);
+  }
+  el.textContent = lines.slice(-40).join('\n');
+}
+
+async function init() {
+  if (!navigator.storage || !navigator.storage.getDirectory) {
+    log('ERROR: OPFS not supported in this browser (need Chromium 102+ / Safari 16.4+ / Firefox 111+)');
+    return;
+  }
+
+  document.getElementById('btnInit').disabled = true;
+  log('Requesting OPFS access...');
+
+  try {
+    const root = await navigator.storage.getDirectory();
+    log('OPFS root obtained');
+
+    log(`Creating ${(OPFS_FILE_SIZE / 1024 / 1024).toFixed(0)} MB test file...`);
+    fileHandle = await root.getFileHandle('frost_poc.dat', { create: true });
+
+    const writable = await fileHandle.createWritable();
+    const chunkSize = 64 * 1024;
+    const totalChunks = Math.ceil(OPFS_FILE_SIZE / chunkSize);
+    const randomData = new Uint8Array(chunkSize);
+
+    for (let i = 0; i < totalChunks; i++) {
+      crypto.getRandomValues(randomData);
+      await writable.write({ type: 'write', data: randomData, position: i * chunkSize });
+      if (i % 16 === 0) {
+        log(`  Writing... ${(i * chunkSize / 1024 / 1024).toFixed(0)} / ${(OPFS_FILE_SIZE / 1024 / 1024).toFixed(0)} MB`);
+      }
+    }
+    await writable.close();
+    log('File written successfully');
+
+    const file = await fileHandle.getFile();
+    fileSize = file.size;
+    document.getElementById('sizeText').textContent = (fileSize / 1024 / 1024).toFixed(0) + ' MB';
+    log(`File size confirmed: ${(fileSize / 1024 / 1024).toFixed(0)} MB`);
+
+    document.getElementById('btnMeasure').disabled = false;
+    document.getElementById('btnExport').disabled = false;
+    log('READY: File ready for SSD timing measurements');
+  } catch (e) {
+    log(`ERROR: ${e.message}`);
+    document.getElementById('btnInit').disabled = false;
+  }
+}
+
+async function measureOnce() {
+  if (!fileHandle || measuring === false) return;
+
+  const offset = Math.floor(Math.random() * (fileSize - READ_SIZE));
+  const offsetAligned = Math.floor(offset / READ_SIZE) * READ_SIZE;
+
+  const t0 = performance.now();
+  try {
+    const file = await fileHandle.getFile();
+    const blob = await file.slice(offsetAligned, offsetAligned + READ_SIZE);
+    const buf = await blob.arrayBuffer();
+    const t1 = performance.now();
+    const elapsed = t1 - t0;
+    measurements.push(elapsed);
+    lastValues.push(elapsed);
+    if (lastValues.length > 100) lastValues.shift();
+  } catch (e) {
+    // silent
+  }
+}
+
+async function startMeasuring() {
+  if (!fileHandle) return;
+  measuring = true;
+  document.getElementById('btnMeasure').disabled = true;
+  document.getElementById('btnStop').disabled = false;
+  document.getElementById('btnExport').disabled = false;
+
+  log('Starting SSD contention measurement loop...');
+  log(`Reading ${(READ_SIZE / 1024).toFixed(0)} KB chunks from random offsets`);
+
+  const loop = async () => {
+    if (!measuring) return;
+    const startBatch = performance.now();
+    const batchSize = 10;
+    const promises = [];
+    for (let i = 0; i < batchSize; i++) {
+      promises.push(measureOnce());
+    }
+    await Promise.all(promises);
+    updateUI();
+    updateTrace();
+    const elapsed = performance.now() - startBatch;
+    const delay = Math.max(0, 5 - elapsed);
+    setTimeout(loop, delay);
+  };
+
+  loop();
+}
+
+function stopMeasuring() {
+  measuring = false;
+  document.getElementById('btnMeasure').disabled = false;
+  document.getElementById('btnStop').disabled = true;
+  log(`Stopped. Collected ${measurements.length} total measurements`);
+}
+
+function exportTrace() {
+  if (measurements.length === 0) { log('No data to export'); return; }
+
+  const data = {
+    timestamp: new Date().toISOString(),
+    fileSizeBytes: fileSize,
+    readSize: READ_SIZE,
+    numSamples: measurements.length,
+    samples: measurements
+  };
+
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `frost_trace_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  log(`Exported ${measurements.length} samples to ${a.download}`);
+}
+
+function generateLoad() {
+  log('Generating synthetic SSD contention by writing temp data...');
+  const heavyLoop = async () => {
+    const root = await navigator.storage.getDirectory();
+    const tmpHandle = await root.getFileHandle('_frost_load.dat', { create: true });
+    const w = await tmpHandle.createWritable();
+    const data = new Uint8Array(1024 * 1024);
+    crypto.getRandomValues(data);
+    for (let i = 0; i < 50; i++) {
+      await w.write({ type: 'write', data, position: i * data.length });
+    }
+    await w.close();
+    log('Contention load complete');
+  };
+  heavyLoop().catch(e => log(`Load error: ${e.message}`));
+}
+
+log('PoC loaded. Browser must support OPFS (Chrome 102+, Edge 102+, Safari 16.4+, Firefox 111+)');
+log('NOTE: For high-resolution timers, serve with COOP/COEP headers (see server.py)');
+</script>
+</body>
+</html>
